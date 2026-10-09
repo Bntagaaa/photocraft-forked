@@ -780,7 +780,7 @@ fn keep_convex(from: [[f64; 2]; 4], to: [[f64; 2]; 4]) -> [[f64; 2]; 4] {
     let sign = t0[0].signum();
     // A sliver: a thousandth of the starting box's smallest turn, so the stop is short of flat.
     let min_turn = t0.iter().map(|t| t.abs()).fold(f64::INFINITY, f64::min) * 1e-3;
-    if !(min_turn.is_finite() && min_turn > 0.0) || !convex(&from, sign, 0.0) || convex(&to, sign, min_turn) {
+    if !(min_turn.is_finite() && min_turn > 0.0 && convex(&from, sign, 0.0)) || convex(&to, sign, min_turn) {
         return to;
     }
     let lerp = |t: f64| -> [[f64; 2]; 4] { std::array::from_fn(|k| [from[k][0] + (to[k][0] - from[k][0]) * t, from[k][1] + (to[k][1] - from[k][1]) * t]) };
@@ -1647,7 +1647,7 @@ pub(crate) fn context_action_supported(command: &str) -> bool {
 }
 
 pub(crate) fn apply_context_action(app: &mut PhotocraftApp, command: &str) -> Result<(), String> {
-    if !app.ui.transform.as_ref().is_some_and(|t| t.warp.is_none()) {
+    if app.ui.transform.as_ref().is_none_or(|t| t.warp.is_some()) {
         return Err("Start a free transform before applying this action".into());
     }
     match command {
