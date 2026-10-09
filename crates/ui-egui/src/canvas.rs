@@ -3191,6 +3191,9 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
     let armed = std::mem::take(&mut app.brush_resize_armed);
     crate::transform_tool::end_if_left(app);
     let mods = crate::workspace_ui::sticky_mods(app, mods);
+    if crate::vector_ui::corner_radius_pointer(app, ev, app.current_zoom(), mods) {
+        return;
+    }
     if app.ui.transform.is_none() && crate::type_transform::pointer(app, ev, mods) {
         return;
     }

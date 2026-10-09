@@ -106,11 +106,12 @@ fn shape_edit_live_params_and_undo() {
     let r = s.execute("shape.edit", json!({"layer": id, "radii": [20, 0, 20, 0]})).unwrap();
     assert_eq!(r["kind"], "roundedRect");
     assert_eq!(r["live"]["radii"], json!([20.0, 0.0, 20.0, 0.0]));
-    // Move keeps the live shape; a rotation drops it.
+    // Move and rotation both keep the editable local rectangle.
     let r = s.execute("shape.edit", json!({"layer": id, "move": [5, 7]})).unwrap();
     assert_eq!(r["live"]["rect"], json!([15.0, 17.0, 100.0, 50.0]));
     let r = s.execute("shape.edit", json!({"layer": id, "transform": [0.0, 1.0, -1.0, 0.0, 150.0, 0.0]})).unwrap();
-    assert_eq!(r["kind"], "path");
+    assert_eq!(r["kind"], "roundedRect");
+    assert!(live_shape_affine(&shape(&s, id)).is_some());
     // Fill/stroke edits merge.
     s.execute("shape.edit", json!({"layer": id, "stroke": {"width": 3}})).unwrap();
     let r = s

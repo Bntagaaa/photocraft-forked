@@ -824,6 +824,9 @@ pub struct UiState {
     /// Pen path under construction.
     #[serde(default)]
     pub pen: Option<crate::vector_ui::PenPath>,
+    /// Active in-canvas live-rectangle corner-radius gesture.
+    #[serde(skip)]
+    pub corner_radius_drag: Option<crate::vector_ui::CornerRadiusDrag>,
     /// Direct Selection tool: selected anchors and the drag in progress (#790).
     #[serde(default)]
     pub direct_selection: crate::direct_select::DirectSelection,
@@ -958,6 +961,7 @@ impl Default for UiState {
             shell: Default::default(),
             layer_filter: Vec::new(),
             pen: None,
+            corner_radius_drag: None,
             direct_selection: Default::default(),
             selected_path: None,
             panels: Panels::default(),

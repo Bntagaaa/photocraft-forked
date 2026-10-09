@@ -162,11 +162,20 @@ fn turns_map_guides_paths_slices_and_live_shapes() {
             _ => None,
         })
         .collect();
-    assert!(
-        live.iter()
-            .any(|l| matches!(l, LiveShape::Rect { rect, .. } if rect.iter().zip([f64::from(H) - 13.0, 40.0, 9.0, 18.0]).all(|(a, b)| (a - b).abs() < 1e-9))),
-        "{live:?}"
-    );
+    assert!(live.iter().any(|l| matches!(l, LiveShape::Rect { .. })), "{live:?}");
+    assert!(d.walk().into_iter().any(|(_, _, layer)| match &layer.content {
+        LayerContent::Shape(sh) if matches!(sh.live.as_ref(), Some(LiveShape::Rect { .. })) => {
+            let Some(a) = crate::vector_cmds::live_shape_affine(sh) else { return false };
+            let Some(LiveShape::Rect { rect: [x, y, w, h], .. }) = &sh.live else { return false };
+            let p = a.apply(photocraft_geom::Point::new(*x, *y));
+            let q = a.apply(photocraft_geom::Point::new(*x + *w, *y + *h));
+            [p.x.min(q.x), p.y.min(q.y), (p.x - q.x).abs(), (p.y - q.y).abs()]
+                .iter()
+                .zip([f64::from(H) - 13.0, 40.0, 9.0, 18.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9)
+        }
+        _ => false,
+    }));
     assert!(live.iter().any(|l| matches!(l, LiveShape::Ellipse { .. })));
     // Flip twice is the identity for the geometry.
     let before = doc(&s).clone();

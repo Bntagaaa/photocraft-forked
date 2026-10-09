@@ -14,6 +14,110 @@ use crate::canvas::ViewXform;
 use crate::state::{Tool, ToolOptions};
 use crate::theme::Tokens;
 
+/// Kept only for the lifetime of a pointer drag; the unique key merges its previews into one undo step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CornerRadiusDrag {
+    layer: photocraft_doc::LayerId,
+    corner: usize,
+    key: String,
+    initial: [f64; 4],
+}
+
+fn live_rectangle(app: &PhotocraftApp) -> Option<(photocraft_doc::LayerId, [f64; 4], [f64; 4], Affine)> {
+    if !matches!(app.ui.tool, Tool::Rectangle | Tool::PathSelection | Tool::DirectSelection) || app.ui.transform.is_some() {
+        return None;
+    }
+    let st = app.session.active()?;
+    let id = st.active_layer?;
+    if st.doc.effective_locks(id).all {
+        return None;
+    }
+    let layer = st.doc.layer(id)?;
+    let LayerContent::Shape(shape) = &layer.content else { return None };
+    let Some(photocraft_doc::vector::LiveShape::Rect { rect, radii }) = &shape.live else { return None };
+    let placement = photocraft_engine::vector_cmds::live_shape_affine(shape)?;
+    placement.inverse()?;
+    Some((id, *rect, *radii, placement))
+}
+
+fn placed_point(point: [f64; 2], placement: &Affine) -> [f64; 2] {
+    let p = placement.apply(photocraft_geom::Point::new(point[0], point[1]));
+    [p.x, p.y]
+}
+
+fn corner_point(rect: [f64; 4], radii: [f64; 4], corner: usize) -> Option<[f64; 2]> {
+    let [x, y, w, h] = rect;
+    if ![x, y, w, h].iter().all(|n| n.is_finite()) || w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let r = radii.get(corner).copied()?.clamp(0.0, w.min(h) / 2.0);
+    // Keep a zero-radius handle away from the transform/anchor control at the corner.
+    let inset = r.max(12.0_f64.min(w / 2.0));
+    Some(match corner {
+        0 => [x + inset, y],
+        1 => [x + w - inset, y],
+        2 => [x + w - inset, y + h],
+        3 => [x + inset, y + h],
+        _ => return None,
+    })
+}
+
+fn radius_from_pointer(rect: [f64; 4], corner: usize, x: f64) -> f64 {
+    let [left, _, width, height] = rect;
+    let distance = if corner == 0 || corner == 3 { x - left } else { left + width - x };
+    distance.clamp(0.0, width.min(height) / 2.0)
+}
+
+/// Handle the four in-canvas radius controls before path and transform hit testing.
+pub fn corner_radius_pointer(app: &mut PhotocraftApp, ev: crate::canvas::ToolEvent, zoom: f32, mods: egui::Modifiers) -> bool {
+    use crate::canvas::ToolEvent;
+    if let Some(drag) = app.ui.corner_radius_drag.clone() {
+        match ev {
+            ToolEvent::Move { x, y, .. } | ToolEvent::Up { x, y } => {
+                if let Some((id, rect, current, placement)) = live_rectangle(app).filter(|(id, _, _, _)| *id == drag.layer) {
+                    let local = placement.inverse().map(|inverse| inverse.apply(photocraft_geom::Point::new(x, y)));
+                    let Some(local) = local else { return false };
+                    let radius = radius_from_pointer(rect, drag.corner, local.x);
+                    let next = if mods.alt {
+                        let mut next = drag.initial;
+                        next[drag.corner] = radius;
+                        next
+                    } else {
+                        [radius; 4]
+                    };
+                    if current != next
+                        && let Err(error) = app.run("shape.edit", json!({"layer": id.0, "radii": next, "coalesce": drag.key}))
+                    {
+                        app.ui.status = error;
+                        app.ui.status_error = true;
+                    }
+                }
+                if matches!(ev, ToolEvent::Up { .. }) {
+                    app.ui.corner_radius_drag = None;
+                }
+                return true;
+            }
+            ToolEvent::Down { .. } => {
+                app.ui.corner_radius_drag = None;
+            }
+        }
+    }
+    let ToolEvent::Down { x, y, .. } = ev else { return false };
+    let Some((layer, rect, radii, placement)) = live_rectangle(app) else { return false };
+    let hit = (0..4).find(|&corner| {
+        corner_point(rect, radii, corner).is_some_and(|p| {
+            let p = placed_point(p, &placement);
+            ((p[0] - x).hypot(p[1] - y) * f64::from(zoom)) <= 9.0
+        })
+    });
+    if let Some(corner) = hit {
+        let key = format!("corner-radius-{}", app.ui.alloc_id());
+        app.ui.corner_radius_drag = Some(CornerRadiusDrag { layer, corner, key, initial: radii });
+        return true;
+    }
+    false
+}
+
 /// Pen tool path under construction: knots as [anchor, in, out] (document px).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PenPath {
@@ -399,6 +503,15 @@ pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform
     let vector_tool = matches!(tool, Tool::Pen | Tool::PathSelection) || is_shape_tool(tool);
     let accent = Tokens::get(painter.ctx()).accent;
     let to_scr = |q: [f64; 2]| xf.to_screen(q[0] as f32, q[1] as f32);
+    if let Some((_, rect, radii, placement)) = live_rectangle(app) {
+        for corner in 0..4 {
+            if let Some(point) = corner_point(rect, radii, corner) {
+                let center = to_scr(placed_point(point, &placement));
+                painter.circle_filled(center, 5.0, Color32::WHITE);
+                painter.circle_stroke(center, 5.0, Stroke::new(1.5, accent));
+            }
+        }
+    }
     let draw_path = |p: &Path, anchors: bool| {
         draw_outline(painter, p, &to_scr, accent);
         if anchors {
@@ -1278,6 +1391,82 @@ mod tests {
         }
         app.run("shape.edit", json!({"layer": id, "radii": 12})).unwrap();
         assert_eq!(get_radii(&app), [12.0; 4]);
+    }
+
+    #[test]
+    fn canvas_corner_handles_link_or_edit_one_corner_with_one_undo_step() {
+        use crate::canvas::{ToolEvent, tool_event};
+        for corner in 0..4 {
+            for (mods, expected) in [
+                (egui::Modifiers::NONE, [30.0; 4]),
+                (egui::Modifiers::ALT, {
+                    let mut radii = [5.0, 10.0, 15.0, 20.0];
+                    radii[corner] = 30.0;
+                    radii
+                }),
+            ] {
+                let mut app = app();
+                app.ui.tool = Tool::Rectangle;
+                let created = app.run("shape.create", json!({"kind":"roundedRect", "rect":[10,10,150,100], "radii":[5,10,15,20]})).unwrap();
+                let id = photocraft_doc::LayerId(created["layer"].as_u64().unwrap());
+                let (_, rect, before, _) = live_rectangle(&app).unwrap();
+                let p = corner_point(rect, before, corner).unwrap();
+                let history = app.session.active().unwrap().history.past_len();
+                let down = ToolEvent::Down { x: p[0], y: p[1], pressure: 1.0 };
+                tool_event(&mut app, down, mods);
+                assert_eq!(app.session.active().unwrap().history.past_len(), history);
+                let x = if corner == 0 || corner == 3 { 40.0 } else { 130.0 };
+                tool_event(&mut app, ToolEvent::Move { x, y: p[1], pressure: 1.0 }, mods);
+                tool_event(&mut app, ToolEvent::Move { x: if corner == 0 || corner == 3 { 36.0 } else { 134.0 }, y: p[1], pressure: 1.0 }, mods);
+                tool_event(&mut app, ToolEvent::Up { x, y: p[1] }, mods);
+                assert!(app.ui.corner_radius_drag.is_none());
+                assert_eq!(app.session.active().unwrap().history.past_len(), history + 1);
+                let radii = |app: &PhotocraftApp| match &app.session.active().unwrap().doc.layer(id).unwrap().content {
+                    LayerContent::Shape(shape) => match &shape.live {
+                        Some(photocraft_doc::vector::LiveShape::Rect { radii, .. }) => *radii,
+                        _ => panic!("live rectangle"),
+                    },
+                    _ => panic!("shape layer"),
+                };
+                assert_eq!(radii(&app), expected);
+                app.run("edit.undo", json!({})).unwrap();
+                assert_eq!(radii(&app), before);
+                app.run("edit.redo", json!({})).unwrap();
+                assert_eq!(radii(&app), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn rotated_rectangle_radius_handle_keeps_placement_and_native_contents() {
+        use crate::canvas::{ToolEvent, tool_event};
+        let mut app = app();
+        app.ui.tool = Tool::Rectangle;
+        let created = app.run("shape.create", json!({"kind":"roundedRect", "rect":[10,10,150,100], "radii":[5,10,15,20]})).unwrap();
+        let id = photocraft_doc::LayerId(created["layer"].as_u64().unwrap());
+        let rotation = Affine::translate(85.0, 60.0).mul(&Affine::rotate(30f64.to_radians())).mul(&Affine::translate(-85.0, -60.0));
+        app.run("shape.edit", json!({"layer":id.0,"transform":rotation.m})).unwrap();
+        let (_, rect, radii, placement) = live_rectangle(&app).expect("rotated live rectangle");
+        let start = placed_point(corner_point(rect, radii, 1).unwrap(), &placement);
+        let end = placed_point([rect[0] + rect[2] - 30.0, rect[1]], &placement);
+        let before = app.session.active().unwrap().history.past_len();
+        tool_event(&mut app, ToolEvent::Down { x: start[0], y: start[1], pressure: 1.0 }, egui::Modifiers::ALT);
+        tool_event(&mut app, ToolEvent::Move { x: end[0], y: end[1], pressure: 1.0 }, egui::Modifiers::ALT);
+        tool_event(&mut app, ToolEvent::Up { x: end[0], y: end[1] }, egui::Modifiers::ALT);
+        assert_eq!(app.session.active().unwrap().history.past_len(), before + 1);
+        let st = app.session.active().unwrap();
+        let LayerContent::Shape(shape) = &st.doc.layer(id).unwrap().content else { panic!("shape") };
+        let Some(photocraft_doc::vector::LiveShape::Rect { radii, .. }) = &shape.live else { panic!("live rectangle") };
+        assert!((radii[1] - 30.0).abs() < 1e-8);
+        let affine = photocraft_engine::vector_cmds::live_shape_affine(shape).unwrap();
+        assert!((affine.m[1] - rotation.m[1]).abs() < 1e-8);
+        let native = photocraft_format::save_to_bytes(&st.doc, &Default::default()).unwrap();
+        let reopened = photocraft_format::load_from_bytes(&native).unwrap();
+        let LayerContent::Shape(saved) = &reopened.layer(id).unwrap().content else { panic!("saved shape") };
+        assert!(photocraft_engine::vector_cmds::live_shape_affine(saved).is_some());
+        app.run("edit.undo", json!({})).unwrap();
+        let (_, _, original, _) = live_rectangle(&app).unwrap();
+        assert_eq!(original, [5.0, 10.0, 15.0, 20.0]);
     }
 
     /// #534: dragging in a shape's fill picker, opened from the Properties panel at the right edge

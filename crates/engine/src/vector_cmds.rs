@@ -456,8 +456,8 @@ pub fn translate_vectors(doc: &Document, l: &mut Layer, dx: f64, dy: f64) {
     }
 }
 
-/// Applies an affine transform to a shape's path, keeping the live shape when the transform
-/// is a translation plus axis-aligned scale (otherwise the shape stops being parametric).
+/// Applies an affine transform to a shape's path. Rectangles retain their local live geometry
+/// through rotations and reflections; their placement is recovered from the path on later edits.
 pub fn transform_shape(sh: &mut ShapeLayer, a: &Affine) {
     sh.path = sh.path.transform(a);
     let [m0, m1, m2, m3, tx, ty] = a.m;
@@ -486,17 +486,62 @@ pub fn transform_shape(sh: &mut ShapeLayer, a: &Affine) {
             };
             let k = (m0.abs() + m1.abs()).min(m2.abs() + m3.abs());
             match l {
-                LiveShape::Rect { rect, radii } if radii.iter().all(|v| (v - radii[0]).abs() < 1e-9) => {
-                    Some(LiveShape::Rect { rect: r(rect), radii: radii.map(|v| v * k) })
-                }
+                // Keep the original local box: the path now carries its affine placement.
+                rect @ LiveShape::Rect { .. } => Some(rect),
                 LiveShape::Ellipse { rect } => Some(LiveShape::Ellipse { rect: r(rect) }),
                 LiveShape::Line { from, to, weight } => Some(LiveShape::Line { from: pt(from), to: pt(to), weight: weight * k }),
                 _ => None,
             }
         }
+        (Some(l @ LiveShape::Rect { .. }), false) => Some(l),
         _ => None,
     };
     sh.psd_raw = None;
+}
+
+/// Placement of a live rectangle's generated path, including rotations and reflections.
+/// Matching knots let geometry edits regenerate the path in local space without losing its
+/// transform; edited or malformed paths do not masquerade as live rectangles.
+pub fn live_shape_affine(sh: &ShapeLayer) -> Option<Affine> {
+    let live = sh.live.as_ref()?;
+    let source = vector::shapes::live_path(live);
+    let a = source.subpaths.first()?.knots.as_slice();
+    let b = sh.path.subpaths.first()?.knots.as_slice();
+    if source.subpaths.len() != 1 || sh.path.subpaths.len() != 1 || a.len() != b.len() || a.len() < 3 {
+        return None;
+    }
+    let p = a.first()?.anchor;
+    let q = b.first()?.anchor;
+    let placement = a.iter().enumerate().skip(1).find_map(|(i, u)| {
+        a.iter().enumerate().skip(i + 1).find_map(|(j, v)| {
+            let (ux, uy) = (u.anchor.x - p.x, u.anchor.y - p.y);
+            let (vx, vy) = (v.anchor.x - p.x, v.anchor.y - p.y);
+            let det = ux * vy - uy * vx;
+            if !det.is_finite() || det.abs() < 1e-9 {
+                return None;
+            }
+            let u = b.get(i)?.anchor;
+            let v = b.get(j)?.anchor;
+            let (ux2, uy2) = (u.x - q.x, u.y - q.y);
+            let (vx2, vy2) = (v.x - q.x, v.y - q.y);
+            let m0 = (ux2 * vy - vx2 * uy) / det;
+            let m2 = (vx2 * ux - ux2 * vx) / det;
+            let m1 = (uy2 * vy - vy2 * uy) / det;
+            let m3 = (vy2 * ux - uy2 * vx) / det;
+            let tx = q.x - m0 * p.x - m2 * p.y;
+            let ty = q.y - m1 * p.x - m3 * p.y;
+            let result = Affine { m: [m0, m1, m2, m3, tx, ty] };
+            result.m.iter().all(|x| x.is_finite()).then_some(result)
+        })
+    })?;
+    let tolerance = 1e-6 * a.iter().map(|k| k.anchor.x.abs().max(k.anchor.y.abs())).fold(1.0f64, f64::max);
+    a.iter()
+        .zip(b)
+        .all(|(src, dst)| {
+            let mapped = placement.apply(src.anchor);
+            (mapped.x - dst.anchor.x).abs() <= tolerance && (mapped.y - dst.anchor.y).abs() <= tolerance
+        })
+        .then_some(placement)
 }
 
 fn shape_info(s: &Session, id: LayerId) -> Result<Value> {
@@ -608,12 +653,13 @@ fn shape_edit(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let geom_keys = ["kind", "rect", "radii", "radius", "sides", "starRatio", "from", "to", "weight"];
         if geom_keys.iter().any(|k| p.get(*k).is_some()) {
+            let placement = live_shape_affine(sh);
             let kind = p.get("kind").and_then(Value::as_str).map(str::to_string).or_else(|| sh.live.as_ref().map(|l| live_kind(l).to_string()));
             let kind = kind.ok_or_else(|| bad(CMD, "this shape has no live-shape parameters; pass `kind` or `path`"))?;
             // Explicit radii on a plain rectangle keep it a (now rounded) rectangle.
             let kind = if kind == "rect" && radii(p).is_some_and(|r| r.iter().any(|v| *v > 0.0)) { "roundedRect".to_string() } else { kind };
             let l = live_from_params(CMD, &kind, p, sh.live.as_ref())?;
-            sh.path = vector::shapes::live_path(&l);
+            sh.path = placement.map_or_else(|| vector::shapes::live_path(&l), |a| vector::shapes::live_path(&l).transform(&a));
             sh.live = Some(l);
             sh.psd_raw = None;
         }
