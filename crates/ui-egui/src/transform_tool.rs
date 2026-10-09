@@ -1351,7 +1351,7 @@ fn readout(t: &TransformSession) -> (f64, f64, f64, f64) {
     (sx, sy, e[1].atan2(e[0]).to_degrees(), 0.0)
 }
 
-/// Width of the mode, cancel and commit cluster kept on the right of the options bar.
+/// Width of the mode, cancel and commit cluster beside the transform fields.
 const ACTIONS_W: f32 = 140.0;
 
 /// Reach of the reference point X/Y fields: the largest document side (`image.canvasSize`'s limit).
@@ -1370,26 +1370,38 @@ fn scale_limit_pct(side: f64) -> f32 {
     ((f64::from(POSITION_LIMIT_PX) / side * 100.0) as f32).clamp(100.0, SCALE_LIMIT_PCT)
 }
 
-/// Options bar while transforming: reference point X/Y, W/H %, angle, interpolation, and, pinned
-/// to the right, the warp switch, cancel and commit.
+/// Keep confirmation next to the active parameters, including on narrow windows.
 pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let Some(t) = app.ui.transform.clone() else { return };
     let bar = ui.available_rect_before_wrap();
-    let split = (bar.right() - ACTIONS_W).max(bar.left());
-    let fields = egui::Rect::from_min_max(bar.min, egui::pos2(split, bar.bottom()));
-    let actions = egui::Rect::from_min_max(egui::pos2(split, bar.top()), bar.max);
+    let split = (bar.left() + ACTIONS_W).min(bar.right());
+    let actions = egui::Rect::from_min_max(bar.min, egui::pos2(split, bar.bottom()));
+    let fields = egui::Rect::from_min_max(egui::pos2(split, bar.top()), bar.max);
+    let mut action_row =
+        ui.new_child(egui::UiBuilder::new().id_salt("transform-actions").max_rect(actions).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    transform_actions(app, &mut action_row, t.warp.is_some());
     {
         let mut row =
             ui.new_child(egui::UiBuilder::new().id_salt("transform-fields").max_rect(fields).layout(egui::Layout::left_to_right(egui::Align::Center)));
         row.set_clip_rect(fields);
-        if let Some(w) = t.warp.clone() {
+        if fields.width() < 760.0 {
+            let more = crate::widgets::secondary_button(&mut row, tl!("Transform"), 0.0);
+            egui::Popup::menu(&more).show(|ui| {
+                ui.set_max_width(fields.width().clamp(250.0, 560.0));
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
+                    if let Some(w) = t.warp.clone() {
+                        warp_fields(app, ui, &w);
+                    } else {
+                        transform_fields(app, ui, &t);
+                    }
+                });
+            });
+        } else if let Some(w) = t.warp.clone() {
             warp_fields(app, &mut row, &w);
         } else {
             transform_fields(app, &mut row, &t);
         }
     }
-    let mut row = ui.new_child(egui::UiBuilder::new().id_salt("transform-actions").max_rect(actions).layout(egui::Layout::right_to_left(egui::Align::Center)));
-    transform_actions(app, &mut row, t.warp.is_some());
 }
 
 fn transform_fields(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &TransformSession) {
@@ -1590,7 +1602,7 @@ fn split_icon(ui: &mut egui::Ui, kind: &str, tip: &str, on: bool) -> egui::Respo
     resp.on_hover_text(tip)
 }
 
-/// Warp switch, cancel and commit, kept on the right of the options bar.
+/// Warp switch, cancel and commit, beside the active transform parameters.
 fn transform_actions(app: &mut PhotocraftApp, ui: &mut egui::Ui, warping: bool) {
     ui.add_space(8.0);
     let commit_tip = if warping {
@@ -1619,6 +1631,34 @@ fn transform_actions(app: &mut PhotocraftApp, ui: &mut egui::Ui, warping: bool) 
             enter_warp(app);
         }
     }
+}
+
+/// Preview-safe context actions. They change the active box and are committed with the rest of
+/// the transform, so Cancel and one-step undo retain their existing meaning.
+pub(crate) fn context_action_supported(command: &str) -> bool {
+    matches!(
+        command,
+        "edit.transform.rotate180"
+            | "edit.transform.rotate90Cw"
+            | "edit.transform.rotate90Ccw"
+            | "edit.transform.flipHorizontal"
+            | "edit.transform.flipVertical"
+    )
+}
+
+pub(crate) fn apply_context_action(app: &mut PhotocraftApp, command: &str) -> Result<(), String> {
+    if !app.ui.transform.as_ref().is_some_and(|t| t.warp.is_none()) {
+        return Err("Start a free transform before applying this action".into());
+    }
+    match command {
+        "edit.transform.rotate180" => rotate_about_pivot(app, std::f64::consts::PI),
+        "edit.transform.rotate90Cw" => rotate_about_pivot(app, std::f64::consts::FRAC_PI_2),
+        "edit.transform.rotate90Ccw" => rotate_about_pivot(app, -std::f64::consts::FRAC_PI_2),
+        "edit.transform.flipHorizontal" => scale_about_pivot(app, -1.0, 1.0),
+        "edit.transform.flipVertical" => scale_about_pivot(app, 1.0, -1.0),
+        _ => return Err(format!("Unsupported transform action: {command}")),
+    }
+    Ok(())
 }
 
 /// Scale the box along its own axes about the reference point.
@@ -1665,7 +1705,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_bar_pins_warp_cancel_and_commit() {
+    fn transform_bar_keeps_actions_accessible_on_narrow_window() {
         use egui_kittest::Harness;
         use egui_kittest::kittest::Queryable;
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
@@ -1685,9 +1725,9 @@ mod tests {
         let commit = h.get_by_label("Commit transform").rect();
         let cancel = h.get_by_label("Cancel transform").rect();
         let mode = h.get_by_label("Switch between free transform and warp modes").rect();
-        assert!(commit.right() > width - 36.0, "commit sits on the right: {commit:?}");
-        assert!(cancel.right() < commit.left() + 1.0, "cancel is left of commit");
-        assert!(mode.right() < cancel.left() + 1.0, "warp switch is left of cancel");
+        assert!(commit.left() < width / 3.0, "commit is beside the parameters: {commit:?}");
+        assert!(commit.right() < cancel.left() + 1.0, "cancel follows commit");
+        assert!(cancel.right() < mode.left() + 1.0, "warp switch follows cancel");
         h.get_by_label("Switch between free transform and warp modes").click();
         h.run_steps(2);
         assert!(h.state().ui.transform.as_ref().unwrap().warp.is_some());
@@ -1699,13 +1739,48 @@ mod tests {
         assert!(h.state().ui.transform.is_none());
     }
 
+    #[test]
+    fn context_actions_change_preview_and_commit_as_one_history_step() {
+        let ctx = egui::Context::default();
+        for (command, expected) in [
+            ("edit.transform.rotate180", [24.0, 24.0]),
+            ("edit.transform.rotate90Cw", [24.0, 8.0]),
+            ("edit.transform.rotate90Ccw", [8.0, 24.0]),
+            ("edit.transform.flipHorizontal", [24.0, 8.0]),
+            ("edit.transform.flipVertical", [8.0, 24.0]),
+        ] {
+            let mut app = app_with_square(64, photocraft_geom::Rect::new(8, 8, 24, 24));
+            let before = app.session.active().unwrap().history.past_len();
+            begin(&mut app, &ctx).unwrap();
+            let initial = app.ui.transform.as_ref().unwrap().quad;
+            crate::canvas_tool_menu::open_transform(&mut app, [10.0, 10.0]);
+            let menu = app.ui.canvas_tool_menu.as_ref().unwrap();
+            assert!(crate::canvas_tool_menu::available(&app, menu, command));
+            crate::canvas_tool_menu::choose(&mut app, &ctx, command);
+            let actual = app.ui.transform.as_ref().unwrap().quad[0];
+            assert!((actual[0] - expected[0]).abs() < 1e-8 && (actual[1] - expected[1]).abs() < 1e-8, "{command}: {actual:?}");
+            assert_eq!(app.session.active().unwrap().history.past_len(), before, "preview has no document history");
+            cancel(&mut app);
+            assert_eq!(app.session.active().unwrap().history.past_len(), before);
+            begin(&mut app, &ctx).unwrap();
+            apply_context_action(&mut app, command).unwrap();
+            assert_ne!(app.ui.transform.as_ref().unwrap().quad, initial);
+            commit(&mut app);
+            assert_eq!(app.session.active().unwrap().history.past_len(), before + 1, "{command}");
+            app.session.undo();
+            assert_eq!(app.session.active().unwrap().history.past_len(), before);
+            app.session.redo();
+            assert_eq!(app.session.active().unwrap().history.past_len(), before + 1);
+        }
+    }
+
     /// Types `text` + Enter into the `n`th numeric field of the transform bar (X, Y, W, H, angle…).
     fn type_into_bar_field(n: usize, text: &str) -> TransformSession {
         use egui_kittest::Harness;
         use egui_kittest::kittest::Queryable;
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
         app.ui.transform = Some(session());
-        let mut h = Harness::builder().with_size(vec2(900.0, 48.0)).build_ui_state(
+        let mut h = Harness::builder().with_size(vec2(1100.0, 48.0)).build_ui_state(
             |ui, app: &mut PhotocraftApp| {
                 if !ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("medium".into()))) {
                     return;

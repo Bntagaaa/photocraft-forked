@@ -32,6 +32,13 @@ pub const TRANSFORM_MENU: &[Row] = &[
     Some(("Skew", "edit.transform.skew")),
     Some(("Distort", "edit.transform.distort")),
     Some(("Perspective", "edit.transform.perspective")),
+    Some(("Warp", "edit.transform.warp")),
+    None,
+    Some(("Rotate 180°", "edit.transform.rotate180")),
+    Some(("Rotate 90° Clockwise", "edit.transform.rotate90Cw")),
+    Some(("Rotate 90° Counter Clockwise", "edit.transform.rotate90Ccw")),
+    Some(("Flip Horizontal", "edit.transform.flipHorizontal")),
+    Some(("Flip Vertical", "edit.transform.flipVertical")),
 ];
 
 /// Photoshop's selection-tool context menu with an active selection, in its order. Its Generative
@@ -140,6 +147,12 @@ pub fn available(app: &PhotocraftApp, menu: &CanvasToolMenu, command: &str) -> b
 /// Is `command` the transform box's current mode (checked in the transform menu)?
 /// Scale and Rotate are Free Transform's mode, so only Free Transform shows it checked.
 fn mode_checked(app: &PhotocraftApp, menu: &CanvasToolMenu, command: &str) -> bool {
+    if menu.transform && command == "edit.transform.warp" {
+        return app.ui.transform.as_ref().is_some_and(|t| t.warp.is_some());
+    }
+    if menu.transform && crate::transform_tool::context_action_supported(command) {
+        return false;
+    }
     menu.transform
         && !matches!(command, "edit.transform.scale" | "edit.transform.rotate")
         && app.ui.transform.as_ref().is_some_and(|t| t.mode == crate::state::TransformMode::for_command(command))
@@ -157,6 +170,12 @@ pub fn open_transform(app: &mut PhotocraftApp, pos: [f32; 2]) -> bool {
 }
 
 pub fn entry_enabled(app: &PhotocraftApp, menu: &CanvasToolMenu, command: &str) -> bool {
+    if menu.transform && crate::transform_tool::context_action_supported(command) {
+        return app.ui.transform.as_ref().is_some_and(|t| t.warp.is_none());
+    }
+    if menu.transform && command == "edit.transform.warp" {
+        return app.ui.transform.as_ref().is_some_and(|t| t.warp.is_none());
+    }
     if menu.transform || menu.tool != Tool::Pen {
         return crate::menus::is_enabled(app, command);
     }
@@ -213,7 +232,9 @@ pub fn choose(app: &mut PhotocraftApp, ctx: &Context, command: &str) {
     if !available(app, &menu, command) {
         return;
     }
-    let result = if menu.tool == Tool::Pen && !menu.transform {
+    let result = if menu.transform && crate::transform_tool::context_action_supported(command) {
+        crate::transform_tool::apply_context_action(app, command)
+    } else if menu.tool == Tool::Pen && !menu.transform {
         choose_pen(app, ctx, &menu, command)
     } else if command == "select.toWorkPath" {
         // Photoshop's Make Work Path… asks for the tolerance first.
