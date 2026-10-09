@@ -122,6 +122,79 @@ fn empty_layer_cannot_be_converted() {
 }
 
 #[test]
+fn selected_layers_convert_to_one_editable_smart_object_and_round_trip() {
+    let mut s = session(8);
+    paint(&mut s);
+    let lower = s.active().unwrap().active_layer.unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    paint(&mut s);
+    let upper = s.active().unwrap().active_layer.unwrap();
+    crate::layer_multi_cmds::set_selection(&mut s, vec![lower, upper], Some(upper), None).unwrap();
+    let before = flat(&s);
+    let count = s.active().unwrap().doc.layers.len();
+    let steps = s.active().unwrap().history.past_len();
+    let new_id = convert(&mut s);
+    let st = s.active().unwrap();
+    assert_eq!(st.doc.layers.len(), count - 1);
+    assert_eq!(st.selected_layers(), vec![LayerId(new_id)]);
+    assert_eq!(st.history.past_len(), steps + 1);
+    assert!(max_diff(&flat(&s), &before) <= 1.0 / 255.0 + 1e-6);
+    let smart = active_smart(&s);
+    let SmartSource::Embedded { file_name, bytes } = &smart.source else { panic!("expected embedded contents") };
+    let nested = decode_source(file_name, bytes).unwrap();
+    assert_eq!(nested.layers[0].children().unwrap().len(), 2);
+    assert_eq!(nested.layers[0].children().unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), vec![lower, upper]);
+    let native = photocraft_format::save_to_bytes(&st.doc, &Default::default()).unwrap();
+    let reopened = photocraft_format::load_from_bytes(&native).unwrap();
+    let LayerContent::Smart(reopened_smart) = &reopened.layer(LayerId(new_id)).unwrap().content else { panic!("smart object lost") };
+    let SmartSource::Embedded { file_name, bytes } = &reopened_smart.source else { panic!("source lost") };
+    assert_eq!(decode_source(file_name, bytes).unwrap().layers[0].children().unwrap().len(), 2);
+    s.undo();
+    assert_eq!(s.active().unwrap().selected_layers(), vec![lower, upper]);
+    assert_eq!(flat(&s), before);
+    s.redo();
+    assert_eq!(s.active().unwrap().selected_layers(), vec![LayerId(new_id)]);
+}
+
+#[test]
+fn noncontiguous_and_locked_multi_selection_fail_without_editing() {
+    let mut s = session(8);
+    paint(&mut s);
+    let first = s.active().unwrap().active_layer.unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    paint(&mut s);
+    s.execute("layer.new.layer", json!({})).unwrap();
+    paint(&mut s);
+    let last = s.active().unwrap().active_layer.unwrap();
+    crate::layer_multi_cmds::set_selection(&mut s, vec![first, last], Some(last), None).unwrap();
+    let steps = s.active().unwrap().history.past_len();
+    let ids: Vec<_> = s.active().unwrap().doc.layers.iter().map(|l| l.id).collect();
+    let err = s.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap_err().to_string();
+    assert!(err.contains("noncontiguous"), "{err}");
+    assert_eq!(s.active().unwrap().history.past_len(), steps);
+    assert_eq!(s.active().unwrap().doc.layers.iter().map(|l| l.id).collect::<Vec<_>>(), ids);
+    s.edit("lock", |doc, _| {
+        doc.layer_mut(first).unwrap().locks.all = true;
+        Ok(())
+    })
+    .unwrap();
+    let steps = s.active().unwrap().history.past_len();
+    let err = s.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap_err().to_string();
+    assert!(err.contains("locked"), "{err}");
+    assert_eq!(s.active().unwrap().history.past_len(), steps);
+    s.edit("blend", |doc, _| {
+        doc.layer_mut(first).unwrap().locks.all = false;
+        doc.layer_mut(first).unwrap().blend = BlendMode::Multiply;
+        Ok(())
+    })
+    .unwrap();
+    let steps = s.active().unwrap().history.past_len();
+    let err = s.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap_err().to_string();
+    assert!(err.contains("blending"), "{err}");
+    assert_eq!(s.active().unwrap().history.past_len(), steps);
+}
+
+#[test]
 fn smart_filters_are_re_editable() {
     for depth in [8, 16] {
         let mut s = session(depth);

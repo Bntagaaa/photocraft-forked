@@ -618,6 +618,49 @@ pub fn layer_to_smart(doc: &Document, l: &Layer) -> Result<Layer> {
 }
 
 fn convert(s: &mut Session, p: &Value) -> Result<Value> {
+    // Explicit targets and a one-layer selection retain the original conversion path.
+    let selected = if p.get("layer").is_some() { Vec::new() } else { s.active().ok_or(EngineError::NoDocument)?.selected_layers() };
+    if selected.len() > 1 {
+        return s.edit("Convert to Smart Object", |doc, active| {
+            let mut paths = Vec::with_capacity(selected.len());
+            for id in &selected {
+                let path = doc.path_of(*id).ok_or(EngineError::NoLayer(*id))?;
+                let layer = doc.layer(*id).ok_or(EngineError::NoLayer(*id))?;
+                if doc.effective_locks(*id).all {
+                    return Err(other(format!("cannot convert locked layer '{}'", layer.name)));
+                }
+                let external_blend = layer.clipped
+                    || !matches!(layer.blend, BlendMode::Normal | BlendMode::PassThrough)
+                    || layer.is_group()
+                        && layer.blend == BlendMode::PassThrough
+                        && any_layer(layer, &|child| child.id != layer.id && child.blend != BlendMode::Normal && child.blend != BlendMode::PassThrough);
+                if external_blend {
+                    return Err(other(format!("cannot convert layer '{}' with external clipping or blending", layer.name)));
+                }
+                paths.push((path, *id));
+            }
+            paths.sort_by(|a, b| a.0.cmp(&b.0));
+            let parent = &paths[0].0[..paths[0].0.len() - 1];
+            if paths.iter().any(|(path, _)| path.len() != parent.len() + 1 || &path[..path.len() - 1] != parent) {
+                return Err(other("selected layers must share the same parent to convert to a smart object"));
+            }
+            let first_index = *paths[0].0.last().ok_or_else(|| other("selected layer has no position"))?;
+            if paths.iter().enumerate().any(|(offset, (path, _))| path.last().copied() != first_index.checked_add(offset)) {
+                return Err(other("noncontiguous selected layers cannot be converted to one smart object"));
+            }
+            let children: Vec<Layer> = paths.iter().map(|(_, id)| doc.layer(*id).cloned().ok_or(EngineError::NoLayer(*id))).collect::<Result<_>>()?;
+            let group = Layer::group("Smart Object", children);
+            let so = layer_to_smart(doc, &group)?;
+            let new_id = so.id;
+            let first = paths[0].1;
+            *doc.layer_mut(first).ok_or(EngineError::NoLayer(first))? = so;
+            for (_, id) in paths.iter().skip(1).rev() {
+                doc.remove(*id).ok_or(EngineError::NoLayer(*id))?;
+            }
+            *active = Some(new_id);
+            Ok(json!({"layer": new_id.0}))
+        });
+    }
     let id = layer_param(s, p)?;
     s.edit("Convert to Smart Object", |doc, active| {
         let l = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
